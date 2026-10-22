@@ -1,0 +1,470 @@
+diff --git a/dist/scripting/AzaharRPC.py b/dist/scripting/AzaharRPC.py
+--- a/dist/scripting/AzaharRPC.py
++++ b/dist/scripting/AzaharRPC.py
+@@ -20,6 +20,8 @@
+     TakeScreenshot = 5,
+     ReadScreenshot = 6,
+     GetPerfStats = 7,
++    SetInput = 100,
++    GetInput = 101,
+ 
+ class ScreenshotResult(enum.IntEnum):
+     Success = 0,
+@@ -35,6 +37,20 @@
+ PERF_STATS_FIELDS = ("system_fps", "game_fps", "time_vblank_interval", "time_hle_svc",
+                      "time_hle_ipc", "time_gpu", "time_swap", "time_remaining",
+                      "emulation_speed", "artic_transmitted", "artic_events")
++
++# HID PadState bits accepted by set_input()
++BUTTONS = {
++    "A": 1 << 0, "B": 1 << 1, "Select": 1 << 2, "Start": 1 << 3,
++    "Right": 1 << 4, "Left": 1 << 5, "Up": 1 << 6, "Down": 1 << 7,
++    "R": 1 << 8, "L": 1 << 9, "X": 1 << 10, "Y": 1 << 11,
++}
++INPUT_FLAG_CIRCLE_PAD = 1 << 0
++INPUT_FLAG_TOUCH = 1 << 1
++MAX_CIRCLE_PAD_POS = 0x9A
++INPUT_STATE_FORMAT = "<IhhHHI"
++INPUT_INFO_FORMAT = "<IhhHHIII"
++# The emulated HID module updates the pad 234 times per emulated second (about 4 per frame)
++PAD_UPDATES_PER_SECOND = 234
+ 
+ CITRA_PORT = 45987
+ 
+@@ -259,6 +275,101 @@
+             return None
+         return dict(zip(PERF_STATS_FIELDS, struct.unpack("<10dI", reply_data[:0x54])))
+ 
++    @staticmethod
++    def _button_mask(buttons):
++        if isinstance(buttons, int):
++            return buttons
++        if isinstance(buttons, str):
++            buttons = [b for b in buttons.split("+") if b]
++        mask = 0
++        for name in buttons:
++            if name not in BUTTONS:
++                raise ValueError("Unknown button {!r}, expected one of {}".format(name, ", ".join(BUTTONS)))
++            mask |= BUTTONS[name]
++        return mask
++
++    @staticmethod
++    def _parse_input_info(reply_data):
++        if len(reply_data) < 0x18:
++            raise RuntimeError("Input request failed (no game running, or an emulator without "
++                               "scripted input support)")
++        buttons, cx, cy, tx, ty, flags, pad_state, pad_updates = struct.unpack(
++            INPUT_INFO_FORMAT, reply_data[:0x18])
++        return {
++            "buttons": [name for name, bit in BUTTONS.items() if buttons & bit],
++            "circle": (cx, cy) if flags & INPUT_FLAG_CIRCLE_PAD else None,
++            "touch": (tx, ty) if flags & INPUT_FLAG_TOUCH else None,
++            "pad_state": pad_state,
++            "pad_updates": pad_updates,
++        }
++
++    def set_input(self, buttons=(), circle=None, touch=None):
++        """
++        Holds the given input until the next set_input() call (like a joypad that stays
++        pressed). It is combined with the keyboard / controller input of the emulator window.
++
++        buttons: a list of names ("A", "Down", ...), a "Down+A" string, or a raw bit mask.
++        circle:  None, or (x, y) with each axis in -1.0..1.0 (up is +y).
++        touch:   None, or (x, y) in bottom screen pixels (0..319, 0..239).
++
++        Returns the same dict as get_input().
++
++        >>> c.set_input()["buttons"]
++        []
++        """
++        flags = 0
++        cx = cy = tx = ty = 0
++        if circle is not None:
++            flags |= INPUT_FLAG_CIRCLE_PAD
++            cx, cy = (max(-MAX_CIRCLE_PAD_POS, min(MAX_CIRCLE_PAD_POS, round(v * MAX_CIRCLE_PAD_POS)))
++                      for v in circle)
++        if touch is not None:
++            flags |= INPUT_FLAG_TOUCH
++            tx, ty = (max(0, int(v)) for v in touch)
++        request_data = struct.pack(INPUT_STATE_FORMAT, self._button_mask(buttons), cx, cy, tx, ty, flags)
++        return self._parse_input_info(self._request(RequestType.SetInput, request_data))
++
++    def release_all(self):
++        """Releases every scripted button, the circle pad and the touch screen."""
++        return self.set_input()
++
++    def get_input(self):
++        """
++        Returns a dict with the held scripted input ("buttons", "circle", "touch"), the
++        "pad_state" bit mask the game last saw (scripted and keyboard input combined), and
++        "pad_updates", a counter of HID pad updates (234 per emulated second).
++
++        >>> sorted(c.get_input().keys())
++        ['buttons', 'circle', 'pad_state', 'pad_updates', 'touch']
++        """
++        return self._parse_input_info(self._request(RequestType.GetInput, struct.pack("II", 0, 0)))
++
++    def wait_pad_updates(self, count, timeout=10.0, poll_interval=0.004):
++        """
++        Waits until the emulated HID module has updated the pad count more times, so waits are
++        in emulated time and stay correct when the emulator runs slow.
++        Raises TimeoutError if the emulator is paused or stopped.
++        """
++        import time
++        start = self.get_input()["pad_updates"]
++        deadline = time.monotonic() + timeout
++        while (self.get_input()["pad_updates"] - start) & 0xFFFFFFFF < count:
++            if time.monotonic() > deadline:
++                raise TimeoutError("The emulator did not update the pad (paused or stopped?)")
++            time.sleep(poll_interval)
++
++    def press(self, buttons, hold=24, release=24, circle=None, touch=None):
++        """
++        Presses and releases: holds the input for hold pad updates, then releases everything
++        and waits release pad updates. The defaults (24 updates) are about 6 frames each.
++        """
++        self.set_input(buttons, circle, touch)
++        try:
++            self.wait_pad_updates(hold)
++        finally:
++            self.release_all()
++        self.wait_pad_updates(release)
++
+ if "__main__" == __name__:
+     import doctest
+     doctest.testmod(extraglobs={'c': AzaharRPC()})
+diff --git a/src/core/hle/service/hid/hid.cpp b/src/core/hle/service/hid/hid.cpp
+--- a/src/core/hle/service/hid/hid.cpp
++++ b/src/core/hle/service/hid/hid.cpp
+@@ -217,6 +217,11 @@
+         state.debug.Assign(buttons[Debug - BUTTON_HID_BEGIN]->GetStatus());
+         state.gpio14.Assign(buttons[Gpio14 - BUTTON_HID_BEGIN]->GetStatus());
+ 
++        const ScriptedInput scripted = GetScriptedInput();
++        // A, B, Select, Start, D-pad, R, L, X, Y
++        constexpr u32 SCRIPTED_BUTTONS_MASK = 0xFFF;
++        state.hex |= scripted.buttons & SCRIPTED_BUTTONS_MASK;
++
+         // Get current circle pad position and update circle pad direction
+         float circle_pad_x_f, circle_pad_y_f;
+         std::tie(circle_pad_x_f, circle_pad_y_f) = circle_pad->GetStatus();
+@@ -229,6 +234,12 @@
+         // These are rounded rather than truncated on actual hardware
+         s16 circle_pad_new_x = static_cast<s16>(std::roundf(circle_pad_x_f * MAX_CIRCLEPAD_POS));
+         s16 circle_pad_new_y = static_cast<s16>(std::roundf(circle_pad_y_f * MAX_CIRCLEPAD_POS));
++        if (scripted.circle_pad_active) {
++            constexpr s16 max_pos = static_cast<s16>(MAX_CIRCLEPAD_POS);
++            constexpr s16 min_pos = static_cast<s16>(-MAX_CIRCLEPAD_POS);
++            circle_pad_new_x = std::clamp(scripted.circle_pad_x, min_pos, max_pos);
++            circle_pad_new_y = std::clamp(scripted.circle_pad_y, min_pos, max_pos);
++        }
+         s16 circle_pad_x = (circle_pad_new_x +
+                             std::accumulate(circle_pad_old_x.begin(), circle_pad_old_x.end(), 0)) /
+                            CIRCLE_PAD_AVERAGING;
+@@ -291,6 +302,13 @@
+         }
+         touch_entry.x = static_cast<u16>(x * Core::kScreenBottomWidth);
+         touch_entry.y = static_cast<u16>(y * Core::kScreenBottomHeight);
++        if (scripted.touch_active) {
++            constexpr u16 max_x = static_cast<u16>(Core::kScreenBottomWidth - 1);
++            constexpr u16 max_y = static_cast<u16>(Core::kScreenBottomHeight - 1);
++            touch_entry.x = std::min(scripted.touch_x, max_x);
++            touch_entry.y = std::min(scripted.touch_y, max_y);
++            pressed = true;
++        }
+         touch_entry.valid.Assign(pressed ? 1 : 0);
+ 
+         system.Movie().HandleTouchStatus(touch_entry);
+@@ -315,6 +333,8 @@
+     mem->pad.sliderstate_3d = (Settings::values.factor_3d.GetValue() / 100.0f);
+     system.Kernel().GetSharedPageHandler().Set3DSlider(Settings::values.factor_3d.GetValue() /
+                                                        100.0f);
++
++    pad_update_count.fetch_add(1);
+ 
+     // Reschedule recurrent event
+     system.CoreTiming().ScheduleEvent(pad_update_ticks - cycles_late, pad_update_event);
+@@ -712,6 +732,20 @@
+     return state;
+ }
+ 
++void Module::SetScriptedInput(const ScriptedInput& input) {
++    std::scoped_lock lock{scripted_input_mutex};
++    scripted_input = input;
++}
++
++ScriptedInput Module::GetScriptedInput() const {
++    std::scoped_lock lock{scripted_input_mutex};
++    return scripted_input;
++}
++
++u32 Module::GetPadUpdateCount() const {
++    return pad_update_count.load();
++}
++
+ std::shared_ptr<Module> GetModule(Core::System& system) {
+     auto hid = system.ServiceManager().GetService<Service::HID::Module::Interface>("hid:USER");
+     if (!hid)
+diff --git a/src/core/hle/service/hid/hid.h b/src/core/hle/service/hid/hid.h
+--- a/src/core/hle/service/hid/hid.h
++++ b/src/core/hle/service/hid/hid.h
+@@ -8,6 +8,7 @@
+ #include <atomic>
+ #include <cstddef>
+ #include <memory>
++#include <mutex>
+ #include <vector>
+ #include <boost/serialization/version.hpp>
+ #include "common/bit_field.h"
+@@ -235,6 +236,18 @@
+     ControllerData last_controller_data{};
+ };
+ 
++/// Input set by a script (RPC server), held until replaced. Buttons are OR'ed with the
++/// frontend's input; the circle pad and touch point replace it while active.
++struct ScriptedInput {
++    u32 buttons = 0; ///< PadState bits, only the 12 regular buttons are used
++    bool circle_pad_active = false;
++    s16 circle_pad_x = 0;
++    s16 circle_pad_y = 0;
++    bool touch_active = false;
++    u16 touch_x = 0; ///< Bottom screen pixels
++    u16 touch_y = 0;
++};
++
+ class Module final {
+ public:
+     explicit Module(Core::System& system);
+@@ -338,6 +351,12 @@
+ 
+     const PadState& GetState() const;
+ 
++    void SetScriptedInput(const ScriptedInput& input);
++    ScriptedInput GetScriptedInput() const;
++
++    /// Number of pad updates since the module was created, for scripts to wait on.
++    u32 GetPadUpdateCount() const;
++
+     // Updating period for each HID device. These empirical values are measured from a 11.2 3DS.
+     static constexpr u64 pad_update_ticks = BASE_CLOCK_RATE_ARM11 / 234;
+     static constexpr u64 accelerometer_update_ticks = BASE_CLOCK_RATE_ARM11 / 104;
+@@ -386,6 +405,12 @@
+     Core::TimingEventType* gyroscope_update_event;
+ 
+     std::atomic<bool> is_device_reload_pending{true};
++
++    // Not serialized: a loaded state keeps the script's current input
++    mutable std::mutex scripted_input_mutex;
++    ScriptedInput scripted_input;
++    std::atomic<u32> pad_update_count{0};
++
+     std::array<std::unique_ptr<Input::ButtonDevice>, Settings::NativeButton::NUM_BUTTONS_HID>
+         buttons;
+     std::unique_ptr<Input::AnalogDevice> circle_pad;
+diff --git a/src/core/rpc/packet.h b/src/core/rpc/packet.h
+--- a/src/core/rpc/packet.h
++++ b/src/core/rpc/packet.h
+@@ -21,6 +21,10 @@
+     TakeScreenshot = 5,
+     ReadScreenshot = 6,
+     GetPerfStats = 7,
++    // Scripted input. Numbered well past the upstream types so a future upstream
++    // request type does not collide with these.
++    SetInput = 100,
++    GetInput = 101,
+ };
+ 
+ struct PacketHeader {
+@@ -74,7 +78,34 @@
+     u32 artic_events;
+ };
+ static_assert(sizeof(PerfStatsInfo) == 0x54, "Incorrect PerfStatsInfo size");
++
++/// Request data of a SetInput request. The input is held until the next SetInput request,
++/// and is combined with the input from the frontend (keyboard / controller).
++struct InputState {
++    u32 buttons;  ///< HID PadState bits: A=0 B=1 Select=2 Start=3 Right=4 Left=5 Up=6 Down=7
++                  ///< R=8 L=9 X=10 Y=11. Other bits are ignored.
++    s16 circle_x; ///< Circle pad position in -0x9A..0x9A, used with InputFlags::CirclePad
++    s16 circle_y;
++    u16 touch_x; ///< Touch point in bottom screen pixels (0..319, 0..239), used with
++    u16 touch_y; ///< InputFlags::Touch
++    u32 flags;   ///< InputFlags
++};
++static_assert(sizeof(InputState) == 0x10, "Incorrect InputState size");
++
++/// Reply data of a SetInput or GetInput request.
++struct InputInfo {
++    InputState held;  ///< The scripted input currently held
++    u32 pad_state;    ///< Last PadState written to HID shared memory (what the game reads)
++    u32 pad_updates;  ///< Number of HID pad updates since the emulated system started (234/s)
++};
++static_assert(sizeof(InputInfo) == 0x18, "Incorrect InputInfo size");
+ #pragma pack(pop)
++
++enum class InputFlags : u32 {
++    CirclePad = (1 << 0), ///< Override the circle pad with circle_x / circle_y
++    Touch = (1 << 1),     ///< Touch the bottom screen at touch_x / touch_y
++};
++DECLARE_ENUM_FLAG_OPERATORS(InputFlags);
+ 
+ constexpr u32 MAX_SCREENSHOT_RES_SCALE = 10;
+ 
+diff --git a/src/core/rpc/rpc_server.cpp b/src/core/rpc/rpc_server.cpp
+--- a/src/core/rpc/rpc_server.cpp
++++ b/src/core/rpc/rpc_server.cpp
+@@ -13,6 +13,7 @@
+ #include "core/core.h"
+ #include "core/frontend/framebuffer_layout.h"
+ #include "core/hle/kernel/process.h"
++#include "core/hle/service/hid/hid.h"
+ #include "core/memory.h"
+ #include "core/rpc/packet.h"
+ #include "core/rpc/rpc_server.h"
+@@ -300,6 +301,58 @@
+     packet.SendReply();
+ }
+ 
++bool RPCServer::ReplyInput(Packet& packet) {
++    const auto hid = Service::HID::GetModule(system);
++    if (!hid) {
++        return false;
++    }
++    const Service::HID::ScriptedInput scripted = hid->GetScriptedInput();
++
++    InputFlags flags{};
++    if (scripted.circle_pad_active) {
++        flags |= InputFlags::CirclePad;
++    }
++    if (scripted.touch_active) {
++        flags |= InputFlags::Touch;
++    }
++    const InputInfo info{
++        .held =
++            {
++                .buttons = scripted.buttons,
++                .circle_x = scripted.circle_pad_x,
++                .circle_y = scripted.circle_pad_y,
++                .touch_x = scripted.touch_x,
++                .touch_y = scripted.touch_y,
++                .flags = static_cast<u32>(flags),
++            },
++        .pad_state = hid->GetState().hex,
++        .pad_updates = hid->GetPadUpdateCount(),
++    };
++    std::memcpy(packet.GetPacketData().data(), &info, sizeof(info));
++    packet.SetPacketDataSize(sizeof(info));
++    packet.SendReply();
++    return true;
++}
++
++bool RPCServer::HandleSetInput(Packet& packet, const InputState& input) {
++    const auto hid = Service::HID::GetModule(system);
++    if (!hid) {
++        LOG_ERROR(RPC_Server, "HID is not available, no game running?");
++        return false;
++    }
++    const auto flags = static_cast<InputFlags>(input.flags);
++    hid->SetScriptedInput({
++        .buttons = input.buttons,
++        .circle_pad_active = True(flags & InputFlags::CirclePad),
++        .circle_pad_x = input.circle_x,
++        .circle_pad_y = input.circle_y,
++        .touch_active = True(flags & InputFlags::Touch),
++        .touch_x = input.touch_x,
++        .touch_y = input.touch_y,
++    });
++    return ReplyInput(packet);
++}
++
+ bool RPCServer::ValidatePacket(const PacketHeader& packet_header) {
+     if (packet_header.version == CURRENT_VERSION) {
+         switch (packet_header.packet_type) {
+@@ -310,6 +363,8 @@
+         case PacketType::TakeScreenshot:
+         case PacketType::ReadScreenshot:
+         case PacketType::GetPerfStats:
++        case PacketType::SetInput:
++        case PacketType::GetInput:
+             if (packet_header.packet_size >= (sizeof(u32) * 2)) {
+                 return true;
+             }
+@@ -378,6 +433,16 @@
+         HandleGetPerfStats(*request_packet, (PerfStatsMode)arg1);
+         success = true;
+         break;
++    case PacketType::SetInput:
++        if (request_packet->GetPacketDataSize() >= sizeof(InputState)) {
++            InputState input;
++            std::memcpy(&input, packet_data.data(), sizeof(input));
++            success = HandleSetInput(*request_packet, input);
++        }
++        break;
++    case PacketType::GetInput:
++        success = ReplyInput(*request_packet);
++        break;
+     default:
+         break;
+     }
+diff --git a/src/core/rpc/rpc_server.h b/src/core/rpc/rpc_server.h
+--- a/src/core/rpc/rpc_server.h
++++ b/src/core/rpc/rpc_server.h
+@@ -53,6 +53,10 @@
+     void HandleTakeScreenshot(std::unique_ptr<Packet> packet, u32 res_scale, ScreenshotFlags flags);
+     void HandleReadScreenshot(Packet& packet, u32 offset, u32 data_size);
+     void HandleGetPerfStats(Packet& packet, PerfStatsMode mode);
++    /// Sets the held scripted input and replies with it. Returns false if HID is not available.
++    bool HandleSetInput(Packet& packet, const InputState& input);
++    /// Replies with the held scripted input and HID state. Returns false if HID is not available.
++    bool ReplyInput(Packet& packet);
+     bool ValidatePacket(const PacketHeader& packet_header);
+     static bool IsCoreRequest(PacketType packet_type);
+     void HandleSingleRequest(std::unique_ptr<Packet> request);
+diff --git a/src/core/rpc/udp_server.cpp b/src/core/rpc/udp_server.cpp
+--- a/src/core/rpc/udp_server.cpp
++++ b/src/core/rpc/udp_server.cpp
+@@ -2,6 +2,7 @@
+ // Licensed under GPLv3 or any later version
+ // Refer to the LICENSE.txt file included.
+ 
++#include <cstdlib>
+ #include <thread>
+ #include <boost/asio.hpp>
+ #include "common/common_types.h"
+@@ -11,13 +12,33 @@
+ 
+ namespace Core::RPC {
+ 
++constexpr u16 DEFAULT_PORT = 45987;
++
++/// The port can be set per process with the AZAHAR_RPC_PORT environment variable, so that
++/// several instances can run on one machine.
++static u16 GetPort() {
++    const char* env = std::getenv("AZAHAR_RPC_PORT");
++    if (env == nullptr || *env == '\0') {
++        return DEFAULT_PORT;
++    }
++    char* end = nullptr;
++    const unsigned long port = std::strtoul(env, &end, 10);
++    if (*end != '\0' || port == 0 || port > 65535) {
++        LOG_ERROR(RPC_Server, "Invalid AZAHAR_RPC_PORT '{}', using {}", env, DEFAULT_PORT);
++        return DEFAULT_PORT;
++    }
++    return static_cast<u16>(port);
++}
++
+ class UDPServer::Impl {
+ public:
+     explicit Impl(std::function<void(std::unique_ptr<Packet>)> new_request_callback)
+-        // Use a random high port
+-        // TODO: Make configurable or increment port number on failure
+-        : socket(io_context, boost::asio::ip::udp::endpoint(boost::asio::ip::udp::v4(), 45987)),
++        : Impl(std::move(new_request_callback), GetPort()) {}
++
++    Impl(std::function<void(std::unique_ptr<Packet>)> new_request_callback, u16 port)
++        : socket(io_context, boost::asio::ip::udp::endpoint(boost::asio::ip::udp::v4(), port)),
+           new_request_callback(std::move(new_request_callback)) {
++        LOG_INFO(RPC_Server, "Listening on UDP port {}", port);
+ 
+         EnsureBufferSize<boost::asio::socket_base::send_buffer_size>(MAX_PACKET_SIZE * 2);
+         EnsureBufferSize<boost::asio::socket_base::receive_buffer_size>(MAX_PACKET_SIZE * 4);
