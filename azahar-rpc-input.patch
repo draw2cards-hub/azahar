@@ -133,6 +133,112 @@ diff --git a/dist/scripting/AzaharRPC.py b/dist/scripting/AzaharRPC.py
  if "__main__" == __name__:
      import doctest
      doctest.testmod(extraglobs={'c': AzaharRPC()})
+diff --git a/src/citra_qt/citra_qt.cpp b/src/citra_qt/citra_qt.cpp
+--- a/src/citra_qt/citra_qt.cpp
++++ b/src/citra_qt/citra_qt.cpp
+@@ -109,6 +109,7 @@
+ #include "core/file_sys/archive_source_sd_savedata.h"
+ #include "core/frontend/applets/default_applets.h"
+ #include "core/hle/service/am/am.h"
++#include "core/hle/service/cfg/cfg.h"
+ #include "core/hle/service/fs/archive.h"
+ #include "core/hle/service/nfc/nfc.h"
+ #include "core/loader/loader.h"
+@@ -116,6 +117,8 @@
+ #include "core/savestate.h"
+ #include "core/system_titles.h"
+ #include "input_common/main.h"
++#include "network/network.h"
++#include "network/room.h"
+ #include "ui_main.h"
+ #include "video_core/gpu.h"
+ #include "video_core/renderer_base.h"
+@@ -270,6 +273,7 @@
+ 
+     QStringList args = QApplication::arguments();
+     QString game_path;
++    QString multiplayer_argument;
+     std::optional<bool> fullscreen_override;
+     for (int i = 1; i < args.size(); ++i) {
+         // Preserves drag/drop functionality
+@@ -368,11 +372,8 @@
+         }
+ 
+         if (args[i] == QStringLiteral("--multiplayer") || args[i] == QStringLiteral("-m")) {
+-            std::cout << "Warning: The --multiplayer option is not yet implemented for the Qt "
+-                         "frontend; Ignoring."
+-                      << std::endl;
+             if (i < args.size() - 1 && !args[i + 1].startsWith(QChar::fromLatin1('-'))) {
+-                i++;
++                multiplayer_argument = args[++i];
+             }
+             continue;
+         }
+@@ -544,9 +545,51 @@
+     physical_devices = GetVulkanPhysicalDevices();
+ #endif
+ 
++    if (!multiplayer_argument.isEmpty()) {
++        JoinRoomFromArgument(multiplayer_argument);
++    }
++
+     if (!game_path.isEmpty()) {
+         BootGame(game_path);
+     }
++}
++
++void GMainWindow::JoinRoomFromArgument(const QString& argument) {
++    // [nickname[:password]@]address[:port]; the nickname defaults to the console's user name and
++    // the port to the default room port, as in the Direct Connect window
++    QString nickname = QString::fromStdString(Service::CFG::GetUsername(system));
++    QString password;
++    QString address = argument;
++    const auto at = argument.lastIndexOf(QChar::fromLatin1('@'));
++    if (at >= 0) {
++        const QString user = argument.left(at);
++        address = argument.mid(at + 1);
++        const auto separator = user.indexOf(QChar::fromLatin1(':'));
++        nickname = separator >= 0 ? user.left(separator) : user;
++        password = separator >= 0 ? user.mid(separator + 1) : QString();
++    }
++    u16 port = Network::DefaultRoomPort;
++    const auto colon = address.lastIndexOf(QChar::fromLatin1(':'));
++    if (colon >= 0) {
++        bool ok = false;
++        const uint parsed = address.mid(colon + 1).toUInt(&ok);
++        if (ok && parsed > 0 && parsed <= 65535) {
++            port = static_cast<u16>(parsed);
++        }
++        address = address.left(colon);
++    }
++    LOG_INFO(Frontend, "Joining room {}:{} as {}", address.toStdString(), port,
++             nickname.toStdString());
++
++    const std::string console_id = Service::CFG::GetConsoleIdHash(system);
++    const auto mac = Service::CFG::GetConsoleMacAddress(system);
++    // Joining waits for the room's answer, so it runs off the UI thread like Direct Connect does
++    static_cast<void>(QtConcurrent::run([nickname = nickname.toStdString(), password = password.toStdString(),
++                                         address = address.toStdString(), port, console_id, mac] {
++        if (auto room_member = Network::GetRoomMember().lock()) {
++            room_member->Join(nickname, console_id, address.c_str(), port, 0, mac, password);
++        }
++    }));
+ }
+ 
+ GMainWindow::~GMainWindow() {
+diff --git a/src/citra_qt/citra_qt.h b/src/citra_qt/citra_qt.h
+--- a/src/citra_qt/citra_qt.h
++++ b/src/citra_qt/citra_qt.h
+@@ -178,6 +178,9 @@
+     bool LoadROM(const QString& filename);
+     void BootGame(const QString& filename);
+     void ShutdownGame();
++    /// Joins a room at start-up (--multiplayer [nickname[:password]@]address[:port]), the same as
++    /// Multiplayer > Direct Connect.
++    void JoinRoomFromArgument(const QString& argument);
+ 
+ #ifdef ENABLE_DISCORD_RPC
+     void SetDiscordEnabled(bool state);
 diff --git a/src/core/hle/service/hid/hid.cpp b/src/core/hle/service/hid/hid.cpp
 --- a/src/core/hle/service/hid/hid.cpp
 +++ b/src/core/hle/service/hid/hid.cpp
